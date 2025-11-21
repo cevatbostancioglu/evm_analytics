@@ -12,7 +12,6 @@ import json
 import simdjson
 import logging
 from typing import List, Dict, Optional, Tuple
-from dataclasses import dataclass
 from datetime import datetime
 import time
 import os
@@ -54,32 +53,12 @@ def hex_to_decimal(hex_string: str) -> Decimal:
         return Decimal('0')
     return Decimal(int(hex_string, 16))
 
-@dataclass
-class ERC20Transfer:
-    block_number: int
-    block_hash: bytes  # Changed to bytes
-    transaction_hash: bytes  # Changed to bytes
-    log_index: int
-    contract_address: bytes  # Address as bytes (20 bytes)
-    from_address: bytes  # Address as bytes (20 bytes)
-    to_address: bytes  # Address as bytes (20 bytes)
-    value: Decimal  # Changed to Decimal for efficient storage
-    timestamp: int
-
-@dataclass
-class NFTTransfer:
-    block_number: int
-    block_hash: bytes
-    transaction_hash: bytes
-    log_index: int
-    contract_address: bytes  # NFT contract address (20 bytes)
-    from_address: bytes  # Sender address (20 bytes)
-    to_address: bytes  # Receiver address (20 bytes)
-    token_id: Decimal  # Token ID as Decimal for large values
-    value: Decimal  # Amount (1 for ERC721, variable for ERC1155)
-    token_standard: str  # 'ERC721' or 'ERC1155'
-    operator: Optional[bytes]  # Operator for ERC1155 (20 bytes), None for ERC721
-    timestamp: int
+# Direct tuple types (no dataclasses for performance)
+# ERC20Transfer tuple: (block_number, block_hash, transaction_hash, log_index,
+#                       contract_address, from_address, to_address, value, timestamp)
+# NFTTransfer tuple: (block_number, block_hash, transaction_hash, log_index,
+#                     contract_address, from_address, to_address, token_id,
+#                     value, token_standard, operator, timestamp)
 
 class ErigonClient:
     def __init__(self, rpc_url: str = "http://localhost:8545"):
@@ -418,11 +397,11 @@ class DatabaseManager:
             ''', start_block, end_block)
         logger.info(f"Marked failed blocks {start_block}-{end_block} as resolved")
 
-    async def insert_transfers(self, transfers: List[ERC20Transfer], skip_duplicate_check: bool = False, conn=None) -> int:
+    async def insert_transfers(self, transfers: List[Tuple], skip_duplicate_check: bool = False, conn=None) -> int:
         """Insert ERC20 transfers into database - returns count of actually inserted rows
 
         Args:
-            transfers: List of transfers to insert
+            transfers: List of transfer tuples to insert
             skip_duplicate_check: If True, skip checking for existing records (faster for new blocks)
             conn: Optional connection to use (for transaction batching)
         """
@@ -436,13 +415,9 @@ class DatabaseManager:
         else:
             return await self._insert_transfers_impl(conn, transfers, skip_duplicate_check)
 
-    async def _insert_transfers_impl(self, conn, transfers: List[ERC20Transfer], skip_duplicate_check: bool):
-        # Prepare data for batch insert
-        transfer_data = [
-            (t.block_number, t.block_hash, t.transaction_hash, t.log_index,
-             t.contract_address, t.from_address, t.to_address, t.value, t.timestamp)
-            for t in transfers
-        ]
+    async def _insert_transfers_impl(self, conn, transfers: List[Tuple], skip_duplicate_check: bool):
+        # Transfers are already tuples, no need to convert
+        transfer_data = transfers
 
         if skip_duplicate_check:
             # Fast path: use COPY for bulk insert (much faster than INSERT)
@@ -469,8 +444,10 @@ class DatabaseManager:
                 return len(transfers)
         else:
             # Slow path: check for existing records first
-            tx_hashes = [t.transaction_hash for t in transfers]
-            log_indices = [t.log_index for t in transfers]
+            # Tuple indices: 0=block_number, 1=block_hash, 2=transaction_hash, 3=log_index,
+            #                4=contract_address, 5=from_address, 6=to_address, 7=value, 8=timestamp
+            tx_hashes = [t[2] for t in transfers]  # transaction_hash
+            log_indices = [t[3] for t in transfers]  # log_index
 
             existing = await conn.fetch('''
                 SELECT transaction_hash, log_index
@@ -485,18 +462,14 @@ class DatabaseManager:
             # Filter out already existing transfers
             new_transfers = [
                 t for t in transfers
-                if (t.transaction_hash, t.log_index) not in existing_set
+                if (t[2], t[3]) not in existing_set  # transaction_hash, log_index
             ]
 
             if not new_transfers:
                 return 0
 
-            # Prepare data for batch insert
-            new_transfer_data = [
-                (t.block_number, t.block_hash, t.transaction_hash, t.log_index,
-                 t.contract_address, t.from_address, t.to_address, t.value, t.timestamp)
-                for t in new_transfers
-            ]
+            # Transfers are already tuples, use directly
+            new_transfer_data = new_transfers
 
             # Use batch insert
             try:
@@ -513,11 +486,11 @@ class DatabaseManager:
                 logger.error(f"Error inserting transfers: {e}")
                 raise
 
-    async def insert_nft_transfers(self, transfers: List['NFTTransfer'], skip_duplicate_check: bool = False, conn=None) -> int:
+    async def insert_nft_transfers(self, transfers: List[Tuple], skip_duplicate_check: bool = False, conn=None) -> int:
         """Insert NFT transfers into database - returns count of actually inserted rows
 
         Args:
-            transfers: List of transfers to insert
+            transfers: List of NFT transfer tuples to insert
             skip_duplicate_check: If True, skip checking for existing records (faster for new blocks)
             conn: Optional connection to use (for transaction batching)
         """
@@ -531,14 +504,9 @@ class DatabaseManager:
         else:
             return await self._insert_nft_transfers_impl(conn, transfers, skip_duplicate_check)
 
-    async def _insert_nft_transfers_impl(self, conn, transfers: List['NFTTransfer'], skip_duplicate_check: bool):
-            # Prepare data for batch insert
-            transfer_data = [
-                (t.block_number, t.block_hash, t.transaction_hash, t.log_index,
-                 t.contract_address, t.from_address, t.to_address, t.token_id,
-                 t.value, t.token_standard, t.operator, t.timestamp)
-                for t in transfers
-            ]
+    async def _insert_nft_transfers_impl(self, conn, transfers: List[Tuple], skip_duplicate_check: bool):
+            # Transfers are already tuples, no need to convert
+            transfer_data = transfers
 
             if skip_duplicate_check:
                 # Fast path: use COPY for bulk insert (much faster than INSERT)
@@ -565,9 +533,12 @@ class DatabaseManager:
                     return len(transfers)
             else:
                 # Slow path: check for existing records first
-                tx_hashes = [t.transaction_hash for t in transfers]
-                log_indices = [t.log_index for t in transfers]
-                token_ids = [t.token_id for t in transfers]
+                # Tuple indices: 0=block_number, 1=block_hash, 2=transaction_hash, 3=log_index,
+                #                4=contract_address, 5=from_address, 6=to_address, 7=token_id,
+                #                8=value, 9=token_standard, 10=operator, 11=timestamp
+                tx_hashes = [t[2] for t in transfers]  # transaction_hash
+                log_indices = [t[3] for t in transfers]  # log_index
+                token_ids = [t[7] for t in transfers]  # token_id
 
                 existing = await conn.fetch('''
                     SELECT transaction_hash, log_index, token_id
@@ -582,19 +553,14 @@ class DatabaseManager:
                 # Filter out already existing transfers
                 new_transfers = [
                     t for t in transfers
-                    if (t.transaction_hash, t.log_index, t.token_id) not in existing_set
+                    if (t[2], t[3], t[7]) not in existing_set  # transaction_hash, log_index, token_id
                 ]
 
                 if not new_transfers:
                     return 0
 
-                # Prepare data for batch insert
-                new_transfer_data = [
-                    (t.block_number, t.block_hash, t.transaction_hash, t.log_index,
-                     t.contract_address, t.from_address, t.to_address, t.token_id,
-                     t.value, t.token_standard, t.operator, t.timestamp)
-                    for t in new_transfers
-                ]
+                # Transfers are already tuples, use directly
+                new_transfer_data = new_transfers
 
                 # Use batch insert
                 try:
@@ -773,48 +739,49 @@ class DatabaseManager:
                 logger.info(f"Creating index: {index_sql.split()[5]}")
                 await conn.execute(index_sql)
 
-def parse_erc20_transfer(log: dict, block_timestamp: int) -> Optional[ERC20Transfer]:
-    """Parse ERC20 transfer from log entry"""
+def parse_erc20_transfer(log: dict, block_timestamp: int) -> Optional[Tuple]:
+    """Parse ERC20 transfer from log entry - returns tuple directly"""
     try:
         # Ensure it's an ERC20 transfer (topic0 = Transfer event signature)
         if not log.get("topics") or log["topics"][0] != ERC20_TRANSFER_TOPIC:
             return None
-        
+
         # ERC20 Transfer event has 3 topics: signature, from, to
         # and data contains the value
         topics = log["topics"]
         if len(topics) != 3:
             return None
-        
+
         # Extract addresses from topics (remove 0x and pad to get address)
         from_address_hex = topics[1][-40:]  # Last 40 chars (20 bytes)
         to_address_hex = topics[2][-40:]    # Last 40 chars (20 bytes)
-        
+
         # Convert to bytes
         from_address = bytes.fromhex(from_address_hex)
         to_address = bytes.fromhex(to_address_hex)
-        
+
         # Value is in the data field - convert to Decimal for efficient storage
         value_hex = log["data"] if log["data"] != "0x" else "0x0"
         value = hex_to_decimal(value_hex)
-        
-        return ERC20Transfer(
-            block_number=int(log["blockNumber"], 16),
-            block_hash=hex_to_bytes(log["blockHash"]),
-            transaction_hash=hex_to_bytes(log["transactionHash"]),
-            log_index=int(log["logIndex"], 16),
-            contract_address=hex_to_bytes(log["address"]),
-            from_address=from_address,
-            to_address=to_address,
-            value=value,
-            timestamp=block_timestamp
+
+        # Return tuple directly (no dataclass)
+        return (
+            int(log["blockNumber"], 16),      # block_number
+            hex_to_bytes(log["blockHash"]),   # block_hash
+            hex_to_bytes(log["transactionHash"]),  # transaction_hash
+            int(log["logIndex"], 16),         # log_index
+            hex_to_bytes(log["address"]),     # contract_address
+            from_address,                     # from_address
+            to_address,                       # to_address
+            value,                            # value
+            block_timestamp                   # timestamp
         )
     except Exception as e:
         logger.warning(f"Error parsing log: {e}")
         return None
 
-def parse_erc721_transfer(log: dict, block_timestamp: int) -> Optional[NFTTransfer]:
-    """Parse ERC721 transfer from log entry"""
+def parse_erc721_transfer(log: dict, block_timestamp: int) -> Optional[Tuple]:
+    """Parse ERC721 transfer from log entry - returns tuple directly"""
     try:
         # ERC721 Transfer has same signature as ERC20 but with 4 topics
         # Transfer(address indexed from, address indexed to, uint256 indexed tokenId)
@@ -835,26 +802,27 @@ def parse_erc721_transfer(log: dict, block_timestamp: int) -> Optional[NFTTransf
         to_address = bytes.fromhex(to_address_hex)
         token_id = hex_to_decimal(token_id_hex)
 
-        return NFTTransfer(
-            block_number=int(log["blockNumber"], 16),
-            block_hash=hex_to_bytes(log["blockHash"]),
-            transaction_hash=hex_to_bytes(log["transactionHash"]),
-            log_index=int(log["logIndex"], 16),
-            contract_address=hex_to_bytes(log["address"]),
-            from_address=from_address,
-            to_address=to_address,
-            token_id=token_id,
-            value=Decimal('1'),  # ERC721 always transfers 1 token
-            token_standard='ERC721',
-            operator=None,
-            timestamp=block_timestamp
+        # Return tuple directly (no dataclass)
+        return (
+            int(log["blockNumber"], 16),      # block_number
+            hex_to_bytes(log["blockHash"]),   # block_hash
+            hex_to_bytes(log["transactionHash"]),  # transaction_hash
+            int(log["logIndex"], 16),         # log_index
+            hex_to_bytes(log["address"]),     # contract_address
+            from_address,                     # from_address
+            to_address,                       # to_address
+            token_id,                         # token_id
+            Decimal('1'),                     # value (ERC721 always transfers 1)
+            'ERC721',                         # token_standard
+            None,                             # operator
+            block_timestamp                   # timestamp
         )
     except Exception as e:
         logger.warning(f"Error parsing ERC721 log: {e}")
         return None
 
-def parse_erc1155_single_transfer(log: dict, block_timestamp: int) -> Optional[NFTTransfer]:
-    """Parse ERC1155 TransferSingle from log entry"""
+def parse_erc1155_single_transfer(log: dict, block_timestamp: int) -> Optional[Tuple]:
+    """Parse ERC1155 TransferSingle from log entry - returns tuple directly"""
     try:
         if not log.get("topics") or log["topics"][0] != ERC1155_TRANSFER_SINGLE_TOPIC:
             return None
@@ -882,26 +850,27 @@ def parse_erc1155_single_transfer(log: dict, block_timestamp: int) -> Optional[N
         token_id = hex_to_decimal('0x' + data[:64])
         value = hex_to_decimal('0x' + data[64:128])
 
-        return NFTTransfer(
-            block_number=int(log["blockNumber"], 16),
-            block_hash=hex_to_bytes(log["blockHash"]),
-            transaction_hash=hex_to_bytes(log["transactionHash"]),
-            log_index=int(log["logIndex"], 16),
-            contract_address=hex_to_bytes(log["address"]),
-            from_address=from_address,
-            to_address=to_address,
-            token_id=token_id,
-            value=value,
-            token_standard='ERC1155',
-            operator=operator,
-            timestamp=block_timestamp
+        # Return tuple directly (no dataclass)
+        return (
+            int(log["blockNumber"], 16),      # block_number
+            hex_to_bytes(log["blockHash"]),   # block_hash
+            hex_to_bytes(log["transactionHash"]),  # transaction_hash
+            int(log["logIndex"], 16),         # log_index
+            hex_to_bytes(log["address"]),     # contract_address
+            from_address,                     # from_address
+            to_address,                       # to_address
+            token_id,                         # token_id
+            value,                            # value
+            'ERC1155',                        # token_standard
+            operator,                         # operator
+            block_timestamp                   # timestamp
         )
     except Exception as e:
         logger.warning(f"Error parsing ERC1155 single log: {e}")
         return None
 
-def parse_erc1155_batch_transfer(log: dict, block_timestamp: int) -> List[NFTTransfer]:
-    """Parse ERC1155 TransferBatch from log entry - returns multiple transfers"""
+def parse_erc1155_batch_transfer(log: dict, block_timestamp: int) -> List[Tuple]:
+    """Parse ERC1155 TransferBatch from log entry - returns multiple tuples"""
     transfers = []
     try:
         if not log.get("topics") or log["topics"][0] != ERC1155_TRANSFER_BATCH_TOPIC:
@@ -947,21 +916,27 @@ def parse_erc1155_batch_transfer(log: dict, block_timestamp: int) -> List[NFTTra
             start = values_offset + 64 + (i * 64)
             values.append(hex_to_decimal('0x' + data[start:start + 64]))
 
-        # Create a transfer for each id/value pair
+        # Create a tuple for each id/value pair
+        block_number = int(log["blockNumber"], 16)
+        block_hash = hex_to_bytes(log["blockHash"])
+        transaction_hash = hex_to_bytes(log["transactionHash"])
+        base_log_index = int(log["logIndex"], 16)
+        contract_address = hex_to_bytes(log["address"])
+
         for idx, (token_id, value) in enumerate(zip(ids, values)):
-            transfer = NFTTransfer(
-                block_number=int(log["blockNumber"], 16),
-                block_hash=hex_to_bytes(log["blockHash"]),
-                transaction_hash=hex_to_bytes(log["transactionHash"]),
-                log_index=int(log["logIndex"], 16) * 1000 + idx,  # Unique log_index for each in batch
-                contract_address=hex_to_bytes(log["address"]),
-                from_address=from_address,
-                to_address=to_address,
-                token_id=token_id,
-                value=value,
-                token_standard='ERC1155',
-                operator=operator,
-                timestamp=block_timestamp
+            transfer = (
+                block_number,                             # block_number
+                block_hash,                               # block_hash
+                transaction_hash,                         # transaction_hash
+                base_log_index * 1000 + idx,             # log_index (unique for each in batch)
+                contract_address,                         # contract_address
+                from_address,                             # from_address
+                to_address,                               # to_address
+                token_id,                                 # token_id
+                value,                                    # value
+                'ERC1155',                                # token_standard
+                operator,                                 # operator
+                block_timestamp                           # timestamp
             )
             transfers.append(transfer)
 
@@ -1012,8 +987,8 @@ class ERC20Extractor:
                 logger.warning(f"Could not determine first block, starting from 0: {e}")
                 return 0
     
-    async def extract_transfers_from_range(self, start_block: int, end_block: int) -> Tuple[List[ERC20Transfer], List[NFTTransfer]]:
-        """Extract ERC20 and NFT transfers from a range of blocks"""
+    async def extract_transfers_from_range(self, start_block: int, end_block: int) -> Tuple[List[Tuple], List[Tuple], int, int, float]:
+        """Extract ERC20 and NFT transfers from a range of blocks - returns tuples directly"""
         process_start_time = time.time()
         block_time_span_str = ""
         start_datetime_str = ""
@@ -1053,10 +1028,11 @@ class ERC20Extractor:
 
             logger.info(f"Found {len(unprocessed_blocks)} unprocessed blocks in range")
 
-            # Get logs for all transfer types in parallel
+            # Get logs for all transfer types in parallel - track RPC time
             all_logs = []
 
             # Fetch all log types in parallel
+            rpc_start = time.time()
             transfer_logs_task = client.get_logs(start_block, end_block, [ERC20_TRANSFER_TOPIC])
             single_logs_task = client.get_logs(start_block, end_block, [ERC1155_TRANSFER_SINGLE_TOPIC])
             batch_logs_task = client.get_logs(start_block, end_block, [ERC1155_TRANSFER_BATCH_TOPIC])
@@ -1066,6 +1042,7 @@ class ERC20Extractor:
                 single_logs_task,
                 batch_logs_task
             )
+            rpc_duration = time.time() - rpc_start
 
             all_logs.extend(transfer_logs)
             all_logs.extend(single_logs)
@@ -1175,14 +1152,19 @@ class ERC20Extractor:
             # Calculate total processing time
             process_duration = time.time() - process_start_time
 
+            # Calculate total transfers and transfers per second
+            total_transfers = erc20_inserted + nft_inserted
+            rpc_tps = total_transfers / rpc_duration if rpc_duration > 0 else 0
+            proc_tps = total_transfers / process_duration if process_duration > 0 else 0
+            db_tps = total_transfers / db_insert_duration if db_insert_duration > 0 else 0
+
+            # Build log message with transfers per second
             log_msg = f"Blocks {start_block}-{end_block}"
             if start_datetime_str:
                 log_msg += f" | {start_datetime_str}"
             if block_time_span_str:
-                log_msg += f" | span: {block_time_span_str} | proc: {process_duration:.2f}s"
-            else:
-                log_msg += f" | proc: {process_duration:.2f}s"
-            log_msg += f" | +ERC20: {erc20_inserted}/{len(erc20_transfers)}, +NFT: {nft_inserted}/{len(nft_transfers)} | DB: {db_insert_duration:.3f}s"
+                log_msg += f" | span: {block_time_span_str}"
+            log_msg += f" | RPC: {rpc_tps:.0f} tx/s | proc: {proc_tps:.0f} tx/s | DB: {db_tps:.0f} tx/s"
 
             logger.info(log_msg)
             return erc20_transfers, nft_transfers, erc20_inserted, nft_inserted, db_insert_duration
@@ -1282,14 +1264,13 @@ class ERC20Extractor:
 
                     # Progress logging
                     progress = ((batch_end - start_block + 1) / (end_block - start_block + 1)) * 100
+                    total_inserted = total_erc20_inserted + total_nft_inserted
                     progress_msg = f"Progress: {progress:.1f}% - Block {batch_end}/{end_block}"
                     if batch_start_datetime_str:
                         progress_msg += f" | {batch_start_datetime_str}"
                     if batch_span_str:
-                        progress_msg += f" | span: {batch_span_str} | DB: {db_time:.3f}s"
-                    else:
-                        progress_msg += f" | DB: {db_time:.3f}s"
-                    progress_msg += f" | Total: +ERC20: {total_erc20_inserted}, +NFT: {total_nft_inserted}"
+                        progress_msg += f" | span: {batch_span_str}"
+                    progress_msg += f" | Total: {total_inserted:,} tx"
                     logger.info(progress_msg)
 
                     current_block = batch_end + 1
@@ -1304,7 +1285,8 @@ class ERC20Extractor:
                     await self.db.record_failed_blocks(current_block, batch_end, error_msg)
                     current_block = batch_end + 1
 
-            logger.info(f"Sync completed! Inserted ERC20: {total_erc20_inserted}, NFT: {total_nft_inserted}")
+            total_inserted = total_erc20_inserted + total_nft_inserted
+            logger.info(f"Sync completed! Inserted {total_inserted:,} transfers (ERC20: {total_erc20_inserted:,}, NFT: {total_nft_inserted:,})")
 
             # Retry any previously failed blocks
             await self.retry_failed_blocks()
