@@ -17,6 +17,15 @@ import time
 import os
 from decimal import Decimal
 
+# gRPC imports (optional - fallback to JSON-RPC if not available)
+try:
+    import grpc
+    import grpc.aio
+    GRPC_AVAILABLE = True
+except ImportError:
+    GRPC_AVAILABLE = False
+    logger.warning("grpcio not installed - gRPC support disabled")
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -117,6 +126,194 @@ class ErigonClient:
             "topics": topics or [ERC20_TRANSFER_TOPIC]
         }
         return await self.rpc_call("eth_getLogs", [filter_params])
+
+
+class ErigonGrpcClient:
+    """
+    gRPC client for Erigon using RLP-encoded blocks for maximum performance
+
+    Note: Erigon's gRPC API doesn't have eth_getLogs equivalent.
+    This client is for block operations only. Use JSON-RPC for getLogs.
+
+    Uses RLP decoding for efficient binary protocol data handling.
+    """
+
+    def __init__(self, grpc_url: str = "localhost:9090"):
+        self.grpc_url = grpc_url
+        self.channel = None
+        self.eth_backend_stub = None
+
+    async def __aenter__(self):
+        if not GRPC_AVAILABLE:
+            raise RuntimeError("grpcio not installed - cannot use gRPC")
+
+        try:
+            # Import generated protobuf stubs
+            from remote import ethbackend_pb2, ethbackend_pb2_grpc
+            from google.protobuf import empty_pb2
+
+            # Create async gRPC channel
+            self.channel = grpc.aio.insecure_channel(self.grpc_url)
+
+            # Initialize ETHBACKEND stub
+            self.eth_backend_stub = ethbackend_pb2_grpc.ETHBACKENDStub(self.channel)
+
+            # Store protobuf modules for later use
+            self.ethbackend_pb2 = ethbackend_pb2
+            self.empty_pb2 = empty_pb2
+
+            logger.debug(f"gRPC client connected to {self.grpc_url}")
+            return self
+        except ImportError as e:
+            raise RuntimeError(f"gRPC proto files not generated: {e}. Run: python3 -m grpc_tools.protoc ...")
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.channel:
+            await self.channel.close()
+
+    async def get_block_by_number(self, block_number: int, full_transactions: bool = False) -> dict:
+        """
+        Get block by number via gRPC with RLP decoding
+        Returns block in JSON-RPC format for compatibility
+        """
+        import rlp
+
+        # Create block request
+        request = self.ethbackend_pb2.BlockRequest(block_height=block_number)
+
+        # Call gRPC method
+        response = await self.eth_backend_stub.Block(request)
+
+        # Decode RLP-encoded block
+        return self._decode_rlp_block(response.block_rlp, block_number)
+
+    async def get_latest_block_number(self) -> int:
+        """Get latest block number via gRPC Syncing method"""
+        request = self.empty_pb2.Empty()
+        response = await self.eth_backend_stub.Syncing(request)
+        return response.current_block
+
+    def _decode_rlp_block(self, block_rlp: bytes, block_number: int) -> dict:
+        """
+        Decode RLP-encoded block to JSON-RPC format
+
+        RLP block structure: [header, transactions, uncles]
+        We only need header for our use case (timestamp)
+        """
+        import rlp
+
+        # Decode the RLP block
+        decoded = rlp.decode(block_rlp)
+
+        if not decoded or len(decoded) < 1:
+            raise ValueError("Invalid RLP block structure")
+
+        # Extract header (first element)
+        header = decoded[0]
+
+        # Header structure (15 fields):
+        # 0: parentHash, 1: sha3Uncles, 2: miner, 3: stateRoot, 4: transactionsRoot
+        # 5: receiptsRoot, 6: logsBloom, 7: difficulty, 8: number, 9: gasLimit
+        # 10: gasUsed, 11: timestamp, 12: extraData, 13: mixHash, 14: nonce
+
+        if len(header) < 15:
+            raise ValueError(f"Invalid header structure, expected 15+ fields, got {len(header)}")
+
+        # Extract timestamp (field 11)
+        timestamp_bytes = header[11]
+        if isinstance(timestamp_bytes, bytes):
+            timestamp = int.from_bytes(timestamp_bytes, byteorder='big') if timestamp_bytes else 0
+        else:
+            timestamp = int(timestamp_bytes)
+
+        # Return in JSON-RPC compatible format
+        return {
+            "number": hex(block_number),
+            "timestamp": hex(timestamp)
+        }
+
+class HybridErigonClient:
+    """
+    Hybrid client that uses both JSON-RPC and gRPC
+
+    - Uses JSON-RPC for getLogs (gRPC doesn't support it)
+    - Can use gRPC for block operations (when available)
+    - Automatically falls back to JSON-RPC if gRPC fails
+    """
+
+    def __init__(self, rpc_url: str = "http://localhost:8545", grpc_url: str = "localhost:9090", use_grpc: bool = False):
+        self.rpc_url = rpc_url
+        self.grpc_url = grpc_url
+        self.use_grpc = use_grpc and GRPC_AVAILABLE
+
+        self.json_client = None
+        self.grpc_client = None
+
+        if self.use_grpc and not GRPC_AVAILABLE:
+            logger.warning("gRPC requested but not available - using JSON-RPC only")
+            self.use_grpc = False
+
+    async def __aenter__(self):
+        # Always initialize JSON-RPC client (needed for getLogs)
+        self.json_client = ErigonClient(self.rpc_url)
+        await self.json_client.__aenter__()
+
+        # Initialize gRPC client if requested
+        if self.use_grpc:
+            try:
+                self.grpc_client = ErigonGrpcClient(self.grpc_url)
+                await self.grpc_client.__aenter__()
+                logger.debug("Hybrid client: Using gRPC for blocks, JSON-RPC for logs")
+            except Exception as e:
+                logger.warning(f"gRPC initialization failed: {e} - falling back to JSON-RPC only")
+                self.grpc_client = None
+                self.use_grpc = False
+        else:
+            logger.debug("Hybrid client: Using JSON-RPC only")
+
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.json_client:
+            await self.json_client.__aexit__(exc_type, exc_val, exc_tb)
+        if self.grpc_client:
+            await self.grpc_client.__aexit__(exc_type, exc_val, exc_tb)
+
+    async def get_block_by_number(self, block_number: int, full_transactions: bool = False) -> dict:
+        """Get block - tries gRPC first if enabled, falls back to JSON-RPC"""
+        if self.use_grpc and self.grpc_client:
+            try:
+                return await self.grpc_client.get_block_by_number(block_number, full_transactions)
+            except (NotImplementedError, Exception) as e:
+                # Fallback to JSON-RPC
+                if not isinstance(e, NotImplementedError):
+                    logger.debug(f"gRPC getBlockByNumber failed, using JSON-RPC: {e}")
+                return await self.json_client.get_block_by_number(block_number, full_transactions)
+        else:
+            return await self.json_client.get_block_by_number(block_number, full_transactions)
+
+    async def get_latest_block_number(self) -> int:
+        """Get latest block number - tries gRPC first if enabled, falls back to JSON-RPC"""
+        if self.use_grpc and self.grpc_client:
+            try:
+                return await self.grpc_client.get_latest_block_number()
+            except (NotImplementedError, Exception) as e:
+                if not isinstance(e, NotImplementedError):
+                    logger.debug(f"gRPC getLatestBlockNumber failed, using JSON-RPC: {e}")
+                return await self.json_client.get_latest_block_number()
+        else:
+            return await self.json_client.get_latest_block_number()
+
+    async def get_first_block_number(self) -> int:
+        """Get first block number - uses JSON-RPC (no gRPC equivalent)"""
+        return await self.json_client.get_first_block_number()
+
+    async def get_logs(self, from_block: int, to_block: int, topics: List[str] = None) -> List[dict]:
+        """
+        Get logs - ALWAYS uses JSON-RPC (gRPC doesn't support eth_getLogs)
+        """
+        return await self.json_client.get_logs(from_block, to_block, topics)
+
 
 class DatabaseManager:
     def __init__(self, connection_string: str = None):
@@ -946,8 +1143,11 @@ def parse_erc1155_batch_transfer(log: dict, block_timestamp: int) -> List[Tuple]
     return transfers
 
 class ERC20Extractor:
-    def __init__(self, rpc_url: str = "http://localhost:8545", connection_string: str = None):
+    def __init__(self, rpc_url: str = "http://localhost:8545", connection_string: str = None,
+                 grpc_url: str = "localhost:9090", use_grpc: bool = False):
         self.rpc_url = rpc_url
+        self.grpc_url = grpc_url
+        self.use_grpc = use_grpc
         self.connection_string = connection_string
         self.batch_size = 100  # Process blocks in batches
         self.db = None
@@ -963,7 +1163,7 @@ class ERC20Extractor:
     
     async def determine_start_block(self, requested_start_block: int = None) -> int:
         """Determine the starting block for processing"""
-        async with ErigonClient(self.rpc_url) as client:
+        async with HybridErigonClient(self.rpc_url, self.grpc_url, self.use_grpc) as client:
             # Get sync progress from database
             last_processed, first_block_db, latest_block_db = await self.db.get_sync_progress()
             
@@ -993,7 +1193,7 @@ class ERC20Extractor:
         block_time_span_str = ""
         start_datetime_str = ""
 
-        async with ErigonClient(self.rpc_url) as client:
+        async with HybridErigonClient(self.rpc_url, self.grpc_url, self.use_grpc) as client:
             # Get timestamps for start and end blocks in parallel
             try:
                 start_block_data, end_block_data = await asyncio.gather(
@@ -1165,6 +1365,7 @@ class ERC20Extractor:
             if block_time_span_str:
                 log_msg += f" | span: {block_time_span_str}"
             log_msg += f" | RPC: {rpc_tps:.0f} tx/s | proc: {proc_tps:.0f} tx/s | DB: {db_tps:.0f} tx/s"
+            log_msg += f" | ERC20: {erc20_inserted} | NFT: {nft_inserted}"
 
             logger.info(log_msg)
             return erc20_transfers, nft_transfers, erc20_inserted, nft_inserted, db_insert_duration
@@ -1204,7 +1405,7 @@ class ERC20Extractor:
             end_block: Ending block number
             max_iterations: Maximum number of batches to process (for testing)
         """
-        async with ErigonClient(self.rpc_url) as client:
+        async with HybridErigonClient(self.rpc_url, self.grpc_url, self.use_grpc) as client:
             # Determine start block
             if start_block is None:
                 start_block = await self.determine_start_block()
@@ -1291,9 +1492,13 @@ class ERC20Extractor:
             # Retry any previously failed blocks
             await self.retry_failed_blocks()
 
-            # Print final stats
-            stats = await self.db.get_stats()
-            logger.info(f"Database stats: {stats}")
+            # Print final stats (skip in iteration mode to avoid timeout)
+            if max_iterations is None:
+                try:
+                    stats = await self.db.get_stats()
+                    logger.info(f"Database stats: {stats}")
+                except Exception as e:
+                    logger.warning(f"Could not get stats: {e}")
     
     async def continuous_sync(self, poll_interval: int = 30):
         """Continuously sync new blocks"""
@@ -1332,10 +1537,12 @@ async def main():
     parser.add_argument("--create-indexes", action="store_true", help="Create indexes on both ERC20 and NFT tables and exit")
     parser.add_argument("--drop-indexes", action="store_true", help="Drop all indexes from ERC20 and NFT tables and exit")
     parser.add_argument("--iteration", type=int, help="Limit number of batches to process (for testing)")
+    parser.add_argument("--grpc-url", default="localhost:9090", help="Erigon gRPC URL (default: localhost:9090)")
+    parser.add_argument("--use-grpc", action="store_true", help="Use gRPC for block operations (experimental)")
 
     args = parser.parse_args()
-    
-    async with ERC20Extractor(args.rpc_url, args.db_url) as extractor:
+
+    async with ERC20Extractor(args.rpc_url, args.db_url, args.grpc_url, args.use_grpc) as extractor:
         extractor.batch_size = args.batch_size
 
         if args.create_indexes:
